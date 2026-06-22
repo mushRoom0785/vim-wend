@@ -1,6 +1,6 @@
 vim9script
 # wend.vim — Text-driven file navigator (Vim9script)
-# Version: 0.4.0 (unreleased; the major version stays 0 until the first tagged release)
+# Version: 0.4.1 (unreleased; the major version stays 0 until the first tagged release)
 # Requires: Vim 9.0+
 #
 # Philosophy: "write is all you need". The buffer IS a live `ls -lai` listing
@@ -36,11 +36,16 @@ vim9script
 #
 # Confirmation: any delete or rename is confirmed once before being applied;
 # deleting '.' (current dir) or '..' (parent dir) is called out explicitly.
+# Answering No re-renders the listing (the buffer is refreshed back to disk
+# reality, so a cancelled delete no longer looks deleted).
 #
 # Display: each row shows the bare name, exactly like `ls -lai` (no conceal, no
 # highlighting). When the cursor lands on a row (in ANY mode) its name expands
 # in place to the full absolute path so edits act on the real path; leaving the
 # row collapses it back to the bare name.
+#
+# State is keyed by inode (see b:wend_byinode), never by line number, so it
+# survives line edits such as dd / o without going stale.
 
 # 10-char ls mode token, plus an optional trailing ACL/SELinux indicator
 # ('.' or '+') as emitted by e.g. Fedora.
@@ -76,11 +81,25 @@ def Abspath(p: string): string
   return a
 enddef
 
+def EntryAt(lnum: number): dict<any>
+  # The entry for a buffer line, resolved by the line's OWN inode (column 1),
+  # so it stays correct even after lines were deleted/inserted above it.
+  if lnum < 1 || lnum > line('$')
+    return {}
+  endif
+  var ln = getline(lnum)
+  if ModeOf(ln) !~ MODE_RE
+    return {}
+  endif
+  return get(b:wend_byinode, InodeOf(ln), {})
+enddef
+
 def Render(dir: string)
   b:wend_dir = dir
-  b:wend_entries = {}        # lnum -> {inode, full, tail, name, type, perm}
+  b:wend_byinode = {}        # inode -> {full, tail, name, type, perm}
   b:wend_name_col = 0        # byte column where the name field starts (fixed per render)
-  b:wend_cur = 0             # currently expanded line (0 = none)
+  b:wend_cur = 0             # line currently expanded (0 = none)
+  b:wend_cur_inode = ''      # inode of the expanded line (guards against stale line numbers)
   var raw: list<string>
   try
     # LC_ALL=C + long-iso => ASCII, deterministic, fixed-width columns:
@@ -117,11 +136,10 @@ def Render(dir: string)
       if modetok =~ MODE_RE && strlen(ln) >= b:wend_name_col
         var tail = strpart(ln, b:wend_name_col)
         var name = substitute(tail, ' -> .*$', '', '')   # strip symlink target for the path
-        if !empty(name)
-          var full = simplify(dir .. '/' .. name)          # also normalises '.' and '..'
-          b:wend_entries[i] = {
-            inode: InodeOf(ln),
-            full: full,
+        var inode = InodeOf(ln)
+        if !empty(name) && !empty(inode)
+          b:wend_byinode[inode] = {
+            full: simplify(dir .. '/' .. name),             # also normalises '.' and '..'
             tail: tail,
             name: name,
             type: strpart(modetok, 0, 1),
@@ -136,12 +154,18 @@ def Render(dir: string)
 enddef
 
 def ExpandLine(lnum: number)
-  var e = b:wend_entries[lnum]
+  var e = EntryAt(lnum)
+  if empty(e)
+    return
+  endif
   setline(lnum, strpart(getline(lnum), 0, b:wend_name_col) .. e.full)
 enddef
 
 def CollapseLine(lnum: number)
-  var e = b:wend_entries[lnum]
+  var e = EntryAt(lnum)
+  if empty(e)
+    return
+  endif
   setline(lnum, strpart(getline(lnum), 0, b:wend_name_col) .. e.tail)
 enddef
 
@@ -150,7 +174,10 @@ def UpdateCursor()
     return
   endif
   var l = line('.')
-  if l == b:wend_cur
+  var ino = InodeOf(getline(l))
+  # Re-sync when the line OR the entry under it changed (the latter happens
+  # after dd, where the line number stays put but a new entry slides in).
+  if l == b:wend_cur && ino ==# b:wend_cur_inode
     return
   endif
   var m = mode()
@@ -158,13 +185,12 @@ def UpdateCursor()
     return
   endif
   var wasmod = &l:modified
-  if b:wend_cur > 0 && b:wend_cur <= line('$') && has_key(b:wend_entries, b:wend_cur)
+  if b:wend_cur > 0
     CollapseLine(b:wend_cur)
   endif
-  if has_key(b:wend_entries, l)
-    ExpandLine(l)
-  endif
+  ExpandLine(l)
   b:wend_cur = l
+  b:wend_cur_inode = ino
   if !wasmod
     setlocal nomodified
   endif
@@ -172,7 +198,7 @@ enddef
 
 def FirstEntryLine(): number
   for i in range(1, line('$'))
-    if has_key(b:wend_entries, i)
+    if !empty(EntryAt(i))
       return i
     endif
   endfor
@@ -219,11 +245,10 @@ def CommitPath()
   # <CR> handler: navigate to / create whatever the current row's name resolves
   # to. Never mutates the listing. stopinsert + nomodified keep this purely a
   # navigation action even if the name was edited in Insert mode.
-  var lnum = line('.')
-  if !has_key(b:wend_entries, lnum)
+  if empty(EntryAt(line('.')))
     return
   endif
-  var p = substitute(strpart(getline(lnum), b:wend_name_col), ' -> .*$', '', '')
+  var p = substitute(strpart(getline(line('.')), b:wend_name_col), ' -> .*$', '', '')
   stopinsert
   setlocal nomodified
   ResolvePath(p)
@@ -234,11 +259,6 @@ def WriteCmd()
     setlocal nomodified
     return
   endif
-  # Index the last rendered listing by inode (its stable identity).
-  var snap: dict<dict<any>> = {}
-  for [lnum, e] in items(b:wend_entries)
-    snap[e.inode] = e
-  endfor
   var chmods: list<dict<any>> = []
   var renames: list<dict<any>> = []
   var seen: dict<bool> = {}
@@ -250,11 +270,11 @@ def WriteCmd()
       continue                 # 'total N', '[empty]', blanks, freely-typed lines: ignored
     endif
     var inode = InodeOf(ln)
-    if empty(inode) || !has_key(snap, inode)
+    if empty(inode) || !has_key(b:wend_byinode, inode)
       add(errs, 'line ' .. lnum .. ': unrecognized row')
       continue
     endif
-    var e = snap[inode]
+    var e = b:wend_byinode[inode]
     seen[inode] = true
     # permission change?
     var newperm = NinePerm(modetok)
@@ -265,10 +285,12 @@ def WriteCmd()
         add(chmods, {full: e.full, perm: newperm, old: e.perm})
       endif
     endif
-    # name change (rename)?
+    # name change (rename)? The displayed name is unchanged whether the row is
+    # collapsed (bare name) or expanded (full path), so a real rename is only
+    # when it matches NEITHER. (This is what fixes the bogus "target exists"
+    # after dd: the slid-up row still reads as its own unchanged name.)
     var field = substitute(strpart(ln, b:wend_name_col), ' -> .*$', '', '')
-    var expected = (lnum == b:wend_cur) ? e.full : e.name
-    if field !=# expected
+    if field !=# e.name && field !=# e.full
       if e.name ==# '.' || e.name ==# '..'
         add(errs, e.name .. ': cannot be renamed')
       else
@@ -291,9 +313,9 @@ def WriteCmd()
       endif
     endif
   endfor
-  # deletions: rows that were in the listing but are gone from the buffer
+  # deletions: entries that were in the listing but are gone from the buffer
   var deletes: list<dict<any>> = []
-  for [inode, e] in items(snap)
+  for [inode, e] in items(b:wend_byinode)
     if !has_key(seen, inode)
       add(deletes, {full: e.full, name: e.name, type: e.type, special: (e.name ==# '.' || e.name ==# '..')})
     endif
@@ -327,7 +349,13 @@ def WriteCmd()
       add(lines, 'chmod  ' .. c.perm .. ' ' .. fnamemodify(c.full, ':t'))
     endfor
     if confirm("wend will apply:\n" .. join(lines, "\n"), "&Yes\n&No", 2) != 1
-      echom 'wend: cancelled'
+      # Cancelled: discard the attempted edits by refreshing from disk so the
+      # buffer no longer looks dd'd / edited.
+      var lc = line('.')
+      Render(b:wend_dir)
+      cursor(min([lc, line('$')]), 1)
+      UpdateCursor()
+      echom 'wend: cancelled (listing refreshed)'
       return
     endif
   endif
@@ -400,8 +428,9 @@ def Open(arg: string)
   setlocal buftype=acwrite bufhidden=wipe noswapfile nolist wrap breakindent
   setlocal filetype=wend
   b:wend_cur = 0
+  b:wend_cur_inode = ''
   b:wend_name_col = 0
-  b:wend_entries = {}
+  b:wend_byinode = {}
   augroup wend_buf
     autocmd! * <buffer>
     autocmd BufWriteCmd <buffer> WriteCmd()
