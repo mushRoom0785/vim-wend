@@ -1,4 +1,4 @@
-# wend-v1
+# vim-wend: <u>w<\u>rite is all you <u>n<\u>ee<u>d<\u>
 edition-driven file navigation plugin for vim.
 
 ## features

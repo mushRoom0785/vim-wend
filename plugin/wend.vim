@@ -1,14 +1,33 @@
 vim9script
-# wend.vim — v1  文本编辑驱动的文件导航器
-# 依赖: Vim 9.0+ (:echo has('vim9script') 应为 1)
-# 语义:
-#   每行 =  <10字符mode>  …/<name>[/]      例: drwxr-xr-x …/src/  /  -rw-r--r-- …/main.c
-#   hjkl  = 普通光标移动(buffer 自带)
-#   i/a   = 当前行路径展开为绝对路径供编辑;  <CR> 提交(存在则导航/不存在则创建); <Esc> 放弃并收起
-#   改 mode 列后 :w = 对发生变化的行执行 chmod(setfperm)
+# wend.vim — v2  Text-driven file navigator (Vim9script)
+# Requires: Vim 9.0+ with +conceal (run :echo has('vim9script') && has('conceal'))
+#
+# Each line:  <10-char mode>  <absolute-path>[/]
+#   e.g.  drwxr-xr-x /home/me/src/         (directory, trailing slash)
+#         -rw-r--r-- /home/me/src/main.c  (file)
+#
+# The leading directory prefix of every path is visually concealed with an
+# ellipsis, EXCEPT on the cursor line, which always shows the full path so you
+# can read/edit it in any mode (this is Vim's native conceal; the buffer text
+# itself is never rewritten, so x/r/dd/i/a all operate on the real path).
+#
+# Keys:
+#   hjkl     normal cursor movement (built in)
+#   <CR>     open the entry on the current line:
+#              dir  -> navigate into it (re-renders this buffer)
+#              file -> :edit it; missing path -> create file, or dir if it
+#                      ends with '/'
+#            works in normal mode, or after editing the path with i/a
+#   :w       apply permission changes: any line whose 10-char mode column was
+#            edited is chmod'd via setfperm()
 
-const ELLIPSIS = '…/'
-const MODE_RE  = '^[-dlpbcs][-rwxsStT]\{9}'   # ls 风格 10 字符模式串
+const CCHAR    = '…'                                      # conceal replacement glyph
+const MODE_RE  = '^[-dlpbcs][-rwxsStT]\{9}$'              # 10-char ls-style mode token
+# Strict positional 9-char permission string (after stripping the type char).
+# setfperm() treats '-' as off and ANY other char as on, so a loose compare
+# would mis-report e.g. 'rxx' == 'rwx'. This regex only accepts meaningful
+# characters in each slot (special bits s/S in exec slots, t/T in the last).
+const PERM_RE  = '^[r-][w-][xsS-][r-][w-][xsS-][r-][w-][xtT-]$'
 
 def Abspath(p: string): string
   var a = fnamemodify(p, ':p')
@@ -33,21 +52,47 @@ def ModeOf(e: dict<any>): string
   elseif e.type ==# 'cdev'
     t = 'c'
   endif
-  return t .. e.perm           # e.perm 是 getfperm 风格 9 字符
+  return t .. e.perm                 # e.perm is a 9-char getfperm()-style string
 enddef
 
 def PathPart(text: string): string
-  # 去掉开头的 mode 列 + 空白, 返回路径部分(可能含 …/ 或已是绝对路径)
+  # Strip the leading mode column + whitespace; return the (absolute) path part.
   return matchstr(text, '^\S\+\s\+\zs.*$')
+enddef
+
+def ClearMatch()
+  # matchadd() IDs are window-bound; drop ours so the conceal does not leak
+  # into whatever buffer next occupies this window.
+  if exists('b:wend_match_id') && b:wend_match_id > 0
+    silent! matchdelete(b:wend_match_id)
+    b:wend_match_id = 0
+  endif
+enddef
+
+def ApplyConceal()
+  ClearMatch()
+  if !has('conceal')
+    return                           # graceful fallback: full paths just show
+  endif
+  # conceallevel=2 + empty concealcursor: concealed text is hidden everywhere
+  # but the cursor line, which is revealed in every mode for editing.
+  setlocal conceallevel=2
+  setlocal concealcursor=
+  var prefix = b:wend_dir .. '/'
+  # Very-nomagic literal match of the absolute dir prefix. It only occurs at
+  # the start of each path (the mode column never contains '/'). matchadd()
+  # conceal is independent of ':syntax', so it works even with 'syntax off'.
+  var pat = '\V' .. escape(prefix, '\')
+  b:wend_match_id = matchadd('Conceal', pat, 10, -1, {conceal: CCHAR})
 enddef
 
 def Render(dir: string)
   b:wend_dir = dir
-  b:wend_snapshot = {}          # fullpath -> 9字符权限(渲染时快照)
+  b:wend_snapshot = {}               # absolute-path -> 9-char perm (render-time snapshot)
   var lines: list<string> = []
   var entries: list<dict<any>>
   try
-    entries = readdirex(dir)    # List<dict>, 默认按名排序; 含隐藏文件
+    entries = readdirex(dir)         # sorted by name, includes dotfiles
   catch
     entries = []
   endtry
@@ -55,16 +100,17 @@ def Render(dir: string)
     var full = dir .. '/' .. e.name
     b:wend_snapshot[full] = e.perm
     var slash = (e.type ==# 'dir' || e.type ==# 'linkd') ? '/' : ''
-    lines->add(ModeOf(e) .. ' ' .. ELLIPSIS .. e.name .. slash)
+    add(lines, ModeOf(e) .. ' ' .. full .. slash)
   endfor
   setlocal modifiable
   silent! :%delete _
   if empty(lines)
-    setline(1, '"" <empty> ' .. dir)
+    setline(1, '[empty] ' .. dir)
   else
     setline(1, lines)
   endif
   setlocal nomodified
+  ApplyConceal()
   normal! gg
 enddef
 
@@ -73,8 +119,7 @@ def NavigateTo(dir: string): bool
   if !isdirectory(d)
     return false
   endif
-  b:wend_expanded = 0
-  silent! exec 'file' fnameescape('wend://' .. d)
+  silent! execute 'file' fnameescape('wend://' .. d)
   Render(d)
   return true
 enddef
@@ -85,50 +130,29 @@ def ResolvePath(raw: string)
     return
   endif
   var wantDir = p =~ '/$'
-  p = substitute(p, '^' .. ELLIPSIS, escape(b:wend_dir .. '/', '\&'), '')
   var ap = Abspath(p)
   if isdirectory(ap)
     NavigateTo(ap)
   elseif filereadable(ap)
-    exec 'edit' fnameescape(ap)
+    ClearMatch()
+    execute 'edit' fnameescape(ap)
   else
     if wantDir
       mkdir(ap, 'p')
       NavigateTo(ap)
     else
-      exec 'edit' fnameescape(ap)   # 不存在的文件: 打开空 buffer, 待用户 :w 落盘
+      ClearMatch()
+      execute 'edit' fnameescape(ap)   # non-existent file: open empty buffer to :w later
     endif
-  endif
-enddef
-
-def ExpandCurrentLine()
-  var lnum = line('.')
-  var text = getline(lnum)
-  if text !~ MODE_RE || stridx(text, ELLIPSIS) < 0
-    b:wend_expanded = 0
-    return
-  endif
-  b:wend_saved_line = text
-  b:wend_expanded = lnum
-  var repl = escape(b:wend_dir .. '/', '\&')
-  setline(lnum, substitute(text, ELLIPSIS, repl, ''))
-enddef
-
-def CollapseCurrentLine()
-  if b:wend_expanded == 0
-    return
-  endif
-  var lnum = b:wend_expanded
-  b:wend_expanded = 0
-  if lnum >= 1 && lnum <= line('$')
-    setline(lnum, b:wend_saved_line)   # <Esc> 放弃路径编辑, 还原折叠态
   endif
 enddef
 
 def CommitPath()
   var p = PathPart(getline('.'))
-  b:wend_expanded = 0       # 取消即将触发的 InsertLeave 收起(避免误改新 buffer)
   stopinsert
+  # Navigation deliberately abandons this listing buffer. Clearing 'modified'
+  # avoids E37 ("no write since last change") when :edit switches to a file.
+  setlocal nomodified
   ResolvePath(p)
 enddef
 
@@ -138,50 +162,54 @@ def WriteCmd()
   for lnum in range(1, line('$'))
     var text = getline(lnum)
     var mode = matchstr(text, '^\S\+')
-    if mode !~ MODE_RE .. '$'
+    if mode !~ MODE_RE
       continue
     endif
-    var pathraw = PathPart(text)
-    pathraw = substitute(pathraw, '^' .. ELLIPSIS, '', '')
-    pathraw = substitute(pathraw, '/$', '', '')
-    var full = b:wend_dir .. '/' .. pathraw
+    var full = substitute(PathPart(text), '/$', '', '')
     if !has_key(b:wend_snapshot, full)
-      continue                       # 只处理已知条目的权限列; 路径改动不在此通道
+      continue                       # only known entries' mode column is a chmod channel
     endif
-    var newperm = strpart(mode, 1)   # 去掉类型字符 -> 9 字符
-    if newperm !=# b:wend_snapshot[full]
-      if setfperm(full, newperm)
-        changed += 1
-      else
-        errs->add(fnamemodify(full, ':t'))
-      endif
+    var newperm = strpart(mode, 1)   # drop the type char -> 9 chars
+    if newperm ==# b:wend_snapshot[full]
+      continue                       # mode column untouched
+    endif
+    if newperm !~ PERM_RE
+      add(errs, fnamemodify(full, ':t') .. ' (bad mode)')
+      continue
+    endif
+    if !setfperm(full, newperm)
+      add(errs, fnamemodify(full, ':t') .. ' (chmod failed)')
+      continue
+    endif
+    # Re-read and compare: only count a change if the bits actually moved.
+    # This kills the false positive where e.g. 'rxx' is identical to 'rwx'.
+    if getfperm(full) !=# b:wend_snapshot[full]
+      changed += 1
     endif
   endfor
-  Render(b:wend_dir)                 # 从文件系统刷新, 顺带重置 modified
+  Render(b:wend_dir)                 # refresh from disk; also resets 'modified'
   if !empty(errs)
-    echohl ErrorMsg | echom 'wend: chmod 失败: ' .. join(errs, ', ') | echohl NONE
+    echohl ErrorMsg | echom 'wend: chmod failed: ' .. join(errs, ', ') | echohl NONE
   else
-    echom 'wend: 已应用 ' .. changed .. ' 处权限修改'
+    echom 'wend: applied ' .. changed .. ' permission change(s)'
   endif
 enddef
 
 def Open(arg: string)
   var dir = Abspath(empty(arg) ? getcwd() : arg)
   if !isdirectory(dir)
-    echohl ErrorMsg | echom 'wend: 不是目录: ' .. dir | echohl NONE
+    echohl ErrorMsg | echom 'wend: not a directory: ' .. dir | echohl NONE
     return
   endif
   enew
-  setlocal buftype=acwrite bufhidden=wipe noswapfile nolist nowrap cursorline
+  setlocal buftype=acwrite bufhidden=wipe noswapfile nolist wrap breakindent
   setlocal filetype=wend
-  b:wend_expanded = 0
-  b:wend_saved_line = ''
   augroup wend_buf
     autocmd! * <buffer>
-    autocmd InsertEnter  <buffer> ExpandCurrentLine()
-    autocmd InsertLeave  <buffer> CollapseCurrentLine()
-    autocmd BufWriteCmd  <buffer> WriteCmd()
+    autocmd BufWriteCmd <buffer> WriteCmd()
+    autocmd BufWinLeave <buffer> ClearMatch()
   augroup END
+  nnoremap <buffer> <silent> <CR> <ScriptCmd>CommitPath()<CR>
   inoremap <buffer> <silent> <CR> <ScriptCmd>CommitPath()<CR>
   NavigateTo(dir)
 enddef
