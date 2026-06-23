@@ -3,6 +3,7 @@
 
 edit-driven file navigation plugin for vim.
 
+*warnning*: still in development, might be buggy.
 
 ## features
 ### edit-driven
