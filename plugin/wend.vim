@@ -1,6 +1,6 @@
 vim9script
 # wend.vim — Text-driven file navigator (Vim9script)
-# Version: 0.4.1 (unreleased; the major version stays 0 until the first tagged release)
+# Version: 0.4.2 (unreleased; the major version stays 0 until the first tagged release)
 # Requires: Vim 9.0+
 #
 # Philosophy: "write is all you need". The buffer IS a live `ls -lai` listing
@@ -196,15 +196,6 @@ def UpdateCursor()
   endif
 enddef
 
-def FirstEntryLine(): number
-  for i in range(1, line('$'))
-    if !empty(EntryAt(i))
-      return i
-    endif
-  endfor
-  return 1
-enddef
-
 def NavigateTo(dir: string): bool
   var d = Abspath(dir)
   if !isdirectory(d)
@@ -212,7 +203,10 @@ def NavigateTo(dir: string): bool
   endif
   silent! execute 'file' fnameescape('wend://' .. d)
   Render(d)
-  cursor(FirstEntryLine(), 1)
+  # Land on line 1 (the `total N` header) at column 1: it is not an entry, so
+  # nothing auto-expands on arrival. A row expands only once the cursor moves
+  # onto it.
+  cursor(1, 1)
   UpdateCursor()
   return true
 enddef
@@ -242,13 +236,25 @@ def ResolvePath(raw: string)
 enddef
 
 def CommitPath()
-  # <CR> handler: navigate to / create whatever the current row's name resolves
-  # to. Never mutates the listing. stopinsert + nomodified keep this purely a
+  # <CR> handler: navigate to / create whatever the current row resolves to.
+  # Never mutates the listing. stopinsert + nomodified keep this purely a
   # navigation action even if the name was edited in Insert mode.
-  if empty(EntryAt(line('.')))
+  var ln = getline(line('.'))
+  var p: string
+  if !empty(EntryAt(line('.')))
+    # A real listing row: take its name field (the full path once expanded).
+    p = substitute(strpart(ln, b:wend_name_col), ' -> .*$', '', '')
+  elseif ln =~ '^\s*total\s' || ln =~ '^\[empty\]'
+    # The `ls` header and the empty-dir placeholder are not creatable paths.
+    return
+  else
+    # A freshly typed line (e.g. opened with `o`): the whole line is the path,
+    # so `o`, a bare name, <CR> creates a file (or a dir if it ends with '/').
+    p = substitute(ln, '^\s*\|\s*$', '', 'g')
+  endif
+  if empty(p)
     return
   endif
-  var p = substitute(strpart(getline(line('.')), b:wend_name_col), ' -> .*$', '', '')
   stopinsert
   setlocal nomodified
   ResolvePath(p)
@@ -328,7 +334,13 @@ def WriteCmd()
     return
   endif
   if empty(chmods) && empty(renames) && empty(deletes)
-    setlocal nomodified
+    # Nothing to commit. Refresh from disk so any freshly typed but unmatched
+    # lines (e.g. an `o` line that was never navigated with <CR>) are cleared
+    # instead of lingering on screen.
+    var ln0 = line('.')
+    Render(b:wend_dir)
+    cursor(min([ln0, line('$')]), 1)
+    UpdateCursor()
     echom 'wend: no changes'
     return
   endif
@@ -418,8 +430,21 @@ def WriteCmd()
   endif
 enddef
 
+def DefaultDir(): string
+  # Directory a no-argument :Wend opens. Prefer the current buffer's own
+  # location over Vim's working directory, since getcwd() does not follow the
+  # buffer you are editing.
+  if exists('b:wend_dir') && !empty(b:wend_dir)
+    return b:wend_dir                 # re-invoked from inside a wend listing
+  endif
+  if &buftype ==# '' && !empty(expand('%'))
+    return expand('%:p:h')            # a real (named) file buffer -> its dir
+  endif
+  return getcwd()                     # unnamed/special buffer -> fall back to cwd
+enddef
+
 def Open(arg: string)
-  var dir = Abspath(empty(arg) ? getcwd() : arg)
+  var dir = Abspath(empty(arg) ? DefaultDir() : arg)
   if !isdirectory(dir)
     echohl ErrorMsg | echom 'wend: not a directory: ' .. dir | echohl NONE
     return
