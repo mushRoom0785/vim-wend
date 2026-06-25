@@ -1,2 +1,5 @@
-# test files/directories
-test/*
+# future test python test file
+__pycache__
+
+# local test scratch / fixtures (scripts/ stays tracked)
+/test/
